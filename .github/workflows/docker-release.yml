@@ -23,7 +23,7 @@ on:
         description: "Existing release tag to build and attach the image archives to (e.g. v0.35.1)."
         required: true
       source_ref:
-        description: "Optional. Build from this ref (branch/SHA) instead of the tag — a build-only dry run that skips the release upload. Use it to validate the pipeline before the tag exists."
+        description: "Optional. Build from this ref (branch, tag, or commit SHA) instead of the release tag — a build-only dry run that skips the release upload. Use it to validate the pipeline before the tag exists."
         required: false
         default: ""
 
@@ -78,6 +78,16 @@ jobs:
           if [ -n "$source_ref" ] && [ "$source_ref" != "$tag" ]; then
             attach=false
             checkout_ref="$source_ref"
+            # `/commits/{ref}` resolves a branch, a tag or a SHA alike, so a
+            # typo (e.g. `master` on this `main` repo) fails here in seconds
+            # with the real branch list, instead of surfacing as an opaque
+            # `git failed with exit code 1` from actions/checkout after three
+            # fetch retries.
+            if ! gh api "repos/${GITHUB_REPOSITORY}/commits/${source_ref}" >/dev/null 2>&1; then
+              branches="$(gh api "repos/${GITHUB_REPOSITORY}/branches?per_page=100" --jq '.[].name' 2>/dev/null | head -20 | paste -sd', ' - || true)"
+              echo "::error::source_ref '$source_ref' does not resolve to a branch, tag or commit in ${GITHUB_REPOSITORY} (branches: ${branches:-could not be listed})"
+              exit 1
+            fi
             echo "::notice::dry run — building from '$source_ref'; archives will NOT be attached to release '$tag'"
           else
             attach=true
@@ -90,7 +100,7 @@ jobs:
             # release-please never cut it) means checkout cannot resolve the ref
             # and there is no release to attach to either.
             if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
-              echo "::error::tag '$tag' does not exist in ${GITHUB_REPOSITORY} — push the tag (or let release-please cut the release) first, or re-run with source_ref set to a branch/SHA for a build-only dry run"
+              echo "::error::tag '$tag' does not exist in ${GITHUB_REPOSITORY} — push the tag (or let release-please cut the release) first, or re-run with source_ref set to a branch, tag or SHA for a build-only dry run"
               exit 1
             fi
           fi
