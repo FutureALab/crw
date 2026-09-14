@@ -1,0 +1,267 @@
+name: Docker Image Release
+
+# Builds the container image for this repo, `docker save`s it into a
+# downloadable archive per architecture, and attaches those archives to the
+# GitHub Release — so a self-hoster can `docker load` a pinned image without
+# pulling from a registry.
+#
+# This is deliberately NOT the GHCR publisher. release.yml's `publish-docker`
+# job stays the single source of the pushed multi-arch manifest; pushing here
+# too would race it for no benefit. This workflow only produces the archives.
+on:
+  # `published` (not `created`/`edited`): the release object has to exist before
+  # the attach job runs, or `gh release upload` has nowhere to put the assets.
+  release:
+    types: [published]
+  # Manual recovery for a tag whose release already exists. Idempotent —
+  # uploads use --clobber, so re-running replaces the archives instead of
+  # failing on a name collision.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build and attach the image archives to (e.g. v0.35.1)."
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-image-release-${{ github.event.inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  release-context:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ctx.outputs.tag }}
+      version: ${{ steps.ctx.outputs.version }}
+      image: ${{ steps.ctx.outputs.image }}
+    steps:
+      - id: ctx
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+            [ -n "$tag" ] || { echo "::error::workflow_dispatch requires the tag input"; exit 1; }
+          else
+            tag="${{ github.event.release.tag_name }}"
+            [ -n "$tag" ] || { echo "::error::could not read the release tag from the event"; exit 1; }
+          fi
+          # Same semver gate as release.yml: a non-version tag has no meaningful
+          # `{{version}}` to tag the image with, so refuse rather than ship an
+          # archive whose tag nobody can predict.
+          echo "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$' \
+            || { echo "::error::tag '$tag' is not semver (expected e.g. v0.35.1)"; exit 1; }
+          version="${tag#v}"
+          # Registry references must be lowercase; a mixed-case owner/repo would
+          # otherwise be rejected by the daemon at build time.
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "image=$image"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::docker image release context: tag=$tag version=$version image=$image"
+
+  build-and-save:
+    needs: release-context
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One leg per architecture. `docker save` cannot represent a
+          # multi-arch manifest in a single loadable archive, so each platform
+          # is built and saved on its own and shipped as its own asset.
+          #
+          # Both legs run on ubuntu-latest + QEMU. That is affordable here
+          # because the Dockerfile compiles on $BUILDPLATFORM (the aarch64 leg
+          # cross-compiles natively); only the runtime stage and the smoke run
+          # below execute under emulation. Swap the arm64 `runner` to a native
+          # `ubuntu-24.04-arm` label to speed that leg up if the repo has the
+          # runners available.
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-context.outputs.tag }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # Labels only: the image tags are built from the release context below so
+      # the exact strings the archive carries are visible in this file.
+      - name: Extract OCI labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ needs.release-context.outputs.image }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.release-context.outputs.tag }}
+
+      # Loads the image into the local daemon (no push) so it can be smoke-run
+      # and `docker save`d. The docker exporter only accepts a single platform,
+      # which is why this job is a per-arch matrix.
+      #
+      # No `cache-to: type=gha`, for the reason documented in release.yml: a run
+      # on a tag ref can only restore its own ref plus the default branch, so
+      # the ~2GB written per release would never be read back.
+      - name: Build image (no push) and load it locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: false
+          load: true
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ${{ needs.release-context.outputs.image }}:${{ needs.release-context.outputs.version }}
+            ${{ needs.release-context.outputs.image }}:${{ needs.release-context.outputs.version }}-linux-${{ matrix.arch }}
+
+      # Proves the bytes about to be shipped actually run on their own
+      # architecture before they become a release asset. The arm64 leg executes
+      # this under QEMU.
+      - name: Smoke-test the loaded image
+        shell: bash
+        env:
+          IMAGE: ${{ needs.release-context.outputs.image }}
+          VERSION: ${{ needs.release-context.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          # The image ships all three workspace binaries (CARGO_PKGS default in
+          # the Dockerfile); a missing one would mean a silently trimmed image.
+          docker run --rm --platform "$PLATFORM" \
+            --entrypoint /bin/sh "${IMAGE}:${VERSION}" \
+            -c 'ls -l /usr/local/bin/crw /usr/local/bin/crw-server /usr/local/bin/crw-mcp'
+          # `--help` exits 0 without booting the server, so no config/network is
+          # needed to prove crw-server is a working binary for this arch.
+          docker run --rm --platform "$PLATFORM" \
+            --entrypoint /usr/local/bin/crw-server "${IMAGE}:${VERSION}" --help >/dev/null
+          docker image inspect "${IMAGE}:${VERSION}" \
+            --format '{{.Architecture}} {{.Os}} {{.Size}} bytes {{len .RepoTags}} tags'
+
+      - name: docker save → gzip archive
+        shell: bash
+        env:
+          IMAGE: ${{ needs.release-context.outputs.image }}
+          VERSION: ${{ needs.release-context.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          asset="crw-docker-${VERSION}-linux-${ARCH}.tar.gz"
+          # Both tags travel inside the archive, so `docker load` restores the
+          # canonical registry reference and an arch-qualified one.
+          docker save -o "${RUNNER_TEMP}/image.tar" \
+            "${IMAGE}:${VERSION}" \
+            "${IMAGE}:${VERSION}-linux-${ARCH}"
+          gzip -9 -c "${RUNNER_TEMP}/image.tar" > "$asset"
+          rm -f "${RUNNER_TEMP}/image.tar"
+          ls -lh "$asset"
+          # Fails the leg on an empty/lfs-stubbed archive instead of attaching a
+          # download that cannot be loaded.
+          gzip -t "$asset"
+          tar -tf <(gzip -dc "$asset") >/dev/null
+
+      - name: Upload archive as a run artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docker-image-linux-${{ matrix.arch }}
+          path: crw-docker-${{ needs.release-context.outputs.version }}-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+          # Already gzip -9'd; recompressing at the artifact layer only burns
+          # CPU and time.
+          compression-level: 0
+          retention-days: 7
+
+  attach-to-release:
+    needs: [release-context, build-and-save]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # Uploading release assets is the one write this workflow performs.
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: docker-image-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify the release exists
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No checkout in this job, so there is no git remote for gh to infer
+          # the target repo from — name it explicitly.
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release-context.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" --json tagName >/dev/null 2>&1; then
+            echo "::error::release '$TAG' does not exist — create it (or let release-please cut it) before attaching image archives"
+            exit 1
+          fi
+
+      - name: Assemble checksums
+        shell: bash
+        env:
+          VERSION: ${{ needs.release-context.outputs.version }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          # One checksum file covering every architecture. Named apart from the
+          # release's plain `SHA256SUMS` on purpose: that file is owned and
+          # signed by release.yml's asset-gate, and clobbering it would drop a
+          # cosign-verified manifest.
+          ( cd dist && sha256sum "crw-docker-${VERSION}-linux-"*.tar.gz > "crw-docker-${VERSION}-SHA256SUMS" )
+          cat "dist/crw-docker-${VERSION}-SHA256SUMS"
+
+      - name: Attach archives to the GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release-context.outputs.tag }}
+          VERSION: ${{ needs.release-context.outputs.version }}
+        run: |
+          set -euo pipefail
+          # `cd dist` so the globs stay flat: gh release upload rejects a path
+          # containing a directory component.
+          cd dist
+          gh release upload "$TAG" \
+            crw-docker-"${VERSION}"-linux-*.tar.gz \
+            crw-docker-"${VERSION}"-SHA256SUMS \
+            --clobber
+
+      - name: Verify the assets are downloadable
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release-context.outputs.tag }}
+          VERSION: ${{ needs.release-context.outputs.version }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          gh release download "$TAG" -D "$work" \
+            -p "crw-docker-${VERSION}-linux-*.tar.gz" \
+            -p "crw-docker-${VERSION}-SHA256SUMS"
+          # `gh release download` verifies nothing, so hash the bytes we just
+          # fetched against the manifest we published.
+          ( cd "$work" && sha256sum -c "crw-docker-${VERSION}-SHA256SUMS" )
+          printf '✓ image archives attached to %s:\n' "$TAG"
+          ls -lh "$work"
