@@ -8,6 +8,12 @@ name: Docker Image Release
 # This is deliberately NOT the GHCR publisher. release.yml's `publish-docker`
 # job stays the single source of the pushed multi-arch manifest; pushing here
 # too would race it for no benefit. This workflow only produces the archives.
+#
+# Two refs decide the build and they are normally the same one (the release
+# tag): the Rust source, and the container recipe (`Dockerfile` + `docker/`).
+# `packaging_ref` splits them on purpose, so a release whose tag predates a
+# stage can still ship a working archive — every tag before the bundled-Chromium
+# `runtime-js` stage is that case.
 on:
   # `published` (not `created`/`edited`): the release object has to exist before
   # the attach job runs, or `gh release upload` has nowhere to put the assets.
@@ -30,6 +36,10 @@ on:
         description: "Optional. Dockerfile target to build. Default runtime-js = self-contained image with the Chromium JS renderer baked in and started by the entrypoint. runtime = the lean image, which ships no renderer and expects a CDP sidecar."
         required: false
         default: "runtime-js"
+      packaging_ref:
+        description: "Optional. Take the container recipe (`Dockerfile` + `docker/`) from this ref while the Rust source still comes from the release tag. Use it to rebuild an older release with a newer recipe — e.g. a tag that predates the bundled-renderer `runtime-js` stage, which would otherwise ship a browser-less image. Leave empty to build the tag's own recipe."
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -49,6 +59,7 @@ jobs:
       # 'true' unless this is a build-only dry run; gates the release upload.
       attach: ${{ steps.ctx.outputs.attach }}
       image_target: ${{ steps.ctx.outputs.image_target }}
+      packaging_ref: ${{ steps.ctx.outputs.packaging_ref }}
     steps:
       - id: ctx
         shell: bash
@@ -63,6 +74,7 @@ jobs:
             source_ref="${{ inputs.source_ref }}"
             image_target="${{ inputs.image_target }}"
             [ -n "$image_target" ] || image_target=runtime-js
+            packaging_ref="${{ inputs.packaging_ref }}"
           else
             tag="${{ github.event.release.tag_name }}"
             [ -n "$tag" ] || { echo "::error::could not read the release tag from the event"; exit 1; }
@@ -70,6 +82,9 @@ jobs:
             # A published release always ships the self-contained image; the
             # lean target is a dispatch-only choice.
             image_target=runtime-js
+            # A release event builds the tag's own recipe: borrowing a recipe
+            # from a later ref is a recovery move, and it stays dispatch-only.
+            packaging_ref=""
           fi
           # Same semver gate as release.yml: a non-version tag has no meaningful
           # `{{version}}` to tag the image with, so refuse rather than ship an
@@ -124,6 +139,42 @@ jobs:
             fi
           fi
 
+          # `--target` only resolves against the tree being built, so a missing
+          # stage is decided by the ref, not by the input: either the release
+          # tag predates the stage (v0.35.1 predates the bundled-Chromium
+          # `runtime-js` stage, which is how a browser-less archive shipped) or
+          # `packaging_ref` points at a ref that never had it. Decide it here,
+          # in seconds — the matrix legs below would otherwise find out ~30
+          # minutes in, after the Rust compile, as a bare "target stage could
+          # not be found" that reads like a typo.
+          if [ -n "$packaging_ref" ]; then
+            if ! gh api "repos/${GITHUB_REPOSITORY}/commits/${packaging_ref}" >/dev/null 2>&1; then
+              echo "::error::packaging_ref '$packaging_ref' does not resolve to a branch, tag or commit in ${GITHUB_REPOSITORY}"
+              exit 1
+            fi
+            dockerfile_ref="$packaging_ref"
+          else
+            # Dry runs build `source_ref`; everything else builds the tag.
+            dockerfile_ref="${source_ref:-$tag}"
+          fi
+          # Read the Dockerfile out of that ref without a checkout: the
+          # contents API resolves a branch, a tag or a SHA alike.
+          dockerfile="$(gh api -H 'Accept: application/vnd.github.raw' \
+            "repos/${GITHUB_REPOSITORY}/contents/Dockerfile?ref=${dockerfile_ref}" 2>/dev/null || true)"
+          if ! grep -qE "^FROM .* AS ${image_target}$" <<<"$dockerfile"; then
+            echo "::group::FROM lines in ${dockerfile_ref}'s Dockerfile"
+            grep -nE '^FROM ' <<<"$dockerfile" || echo "(no Dockerfile readable at ${dockerfile_ref})"
+            echo "::endgroup::"
+            if [ -n "$packaging_ref" ]; then
+              echo "::error::packaging_ref '$packaging_ref' has no '${image_target}' stage in its Dockerfile — point it at a ref that has one (main does), or dispatch with image_target=runtime for the lean sidecar image"
+            elif [ "$image_target" = "runtime-js" ]; then
+              echo "::error::Dockerfile at ${checkout_ref} has no 'runtime-js' stage — that ref predates the bundled-renderer image, so an archive built from it ships without a browser. Dispatch with packaging_ref=<ref> to rebuild this tag's own source with a newer container recipe (the Dockerfile and docker/ come from that ref; the Rust code still comes from ${checkout_ref}), re-point the release at a commit that has the stage, or dispatch with image_target=runtime for the lean sidecar image."
+            else
+              echo "::error::Dockerfile at ${checkout_ref} has no '${image_target}' stage — this ref predates named runtime stages (its final stage is unnamed), so it cannot be addressed with --target at all. Dispatch with packaging_ref=<ref> to rebuild this tag's own source with a newer container recipe (the Dockerfile and docker/ come from that ref; the Rust code still comes from ${checkout_ref})."
+            fi
+            exit 1
+          fi
+
           {
             echo "tag=$tag"
             echo "version=$version"
@@ -131,8 +182,9 @@ jobs:
             echo "checkout_ref=$checkout_ref"
             echo "attach=$attach"
             echo "image_target=$image_target"
+            echo "packaging_ref=$packaging_ref"
           } >> "$GITHUB_OUTPUT"
-          echo "::notice::docker image release context: tag=$tag version=$version image=$image ref=$checkout_ref attach=$attach target=$image_target"
+          echo "::notice::docker image release context: tag=$tag version=$version image=$image ref=$checkout_ref attach=$attach target=$image_target recipe=${dockerfile_ref}"
 
   build-and-save:
     needs: release-context
@@ -166,11 +218,37 @@ jobs:
         with:
           ref: ${{ needs.release-context.outputs.checkout_ref }}
 
+      # The release tag decides the Rust source; the container recipe can come
+      # from a ref that has the stage the tag predates (see `packaging_ref`).
+      # Only Dockerfile + docker/ are borrowed, so the compiled code stays the
+      # release's: what is rebuilt is how this release is packaged, not what is
+      # inside it.
+      - name: Borrow the container recipe
+        if: ${{ needs.release-context.outputs.packaging_ref != '' }}
+        shell: bash
+        env:
+          PACKAGING_REF: ${{ needs.release-context.outputs.packaging_ref }}
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          # `git fetch` + a pathspec checkout rather than a second checkout:
+          # the working tree being compiled has to stay the tag's.
+          git fetch --depth=1 origin "$PACKAGING_REF"
+          git checkout FETCH_HEAD -- Dockerfile
+          # Only pull docker/ in when that ref actually has it, so a recipe that
+          # does not COPY anything from there still applies cleanly.
+          if git cat-file -e 'FETCH_HEAD:docker/crw-entrypoint.sh' 2>/dev/null; then
+            git checkout FETCH_HEAD -- docker
+          fi
+          echo "::warning::container recipe (Dockerfile + docker/) taken from '${PACKAGING_REF}'; the code in this image is still ${source_sha}"
+
       # A tag can point at a commit older than the Dockerfile change that added
       # `runtime-js`. `docker buildx --target` then fails with a bare
       # "target stage could not be found" that reads like a typo, while the real
       # problem is that the tagged tree predates the bundled-renderer image.
-      # Say so here, in seconds, before the ~30 minute Rust compile.
+      # `release-context` already refuses that combination in seconds; this
+      # re-checks the tree that is actually about to be built (after any recipe
+      # swap), so the gate lives with the build rather than only upstream of it.
       - name: Verify the requested target exists in this ref
         shell: bash
         env:
@@ -179,7 +257,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! grep -qE "^FROM .* AS ${TARGET}$" Dockerfile; then
-            echo "::error::Dockerfile at ${REF} has no '${TARGET}' stage — that ref predates the bundled-renderer image. Re-point the tag at a commit that has it, or dispatch with image_target=runtime."
+            echo "::error::the Dockerfile built from ${REF} has no '${TARGET}' stage. Re-point the release at a commit that has it, dispatch with packaging_ref=<ref> to borrow a newer container recipe, or dispatch with image_target=runtime for the lean sidecar image."
             echo "::group::stages available at ${REF}"
             grep -nE '^FROM ' Dockerfile || true
             echo "::endgroup::"
@@ -243,6 +321,7 @@ jobs:
           IMAGE: ${{ needs.release-context.outputs.image }}
           VERSION: ${{ needs.release-context.outputs.version }}
           PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ needs.release-context.outputs.image_target }}
         run: |
           set -euo pipefail
           # The image ships all three workspace binaries (CARGO_PKGS default in
@@ -250,6 +329,20 @@ jobs:
           docker run --rm --platform "$PLATFORM" \
             --entrypoint /bin/sh "${IMAGE}:${VERSION}" \
             -c 'ls -l /usr/local/bin/crw /usr/local/bin/crw-server /usr/local/bin/crw-mcp'
+          # runtime-js is the whole reason this workflow exists: an archive
+          # somebody downloads has to render JS with no sidecar. Assert the
+          # baked backend really is inside it — a target mix-up already shipped
+          # a browser-less archive once — and hand off through the entrypoint,
+          # so the browser starts the way a self-hoster's `docker run` starts
+          # it. A backend that fails to come up degrades to "no renderer"
+          # without failing the run, by design (see docker/crw-entrypoint.sh).
+          if [ "$TARGET" = "runtime-js" ]; then
+            docker run --rm --platform "$PLATFORM" \
+              --entrypoint /bin/sh "${IMAGE}:${VERSION}" \
+              -c 'command -v chromium && test -x /usr/local/bin/crw-entrypoint'
+            docker run --rm --platform "$PLATFORM" \
+              "${IMAGE}:${VERSION}" crw-server --help >/dev/null
+          fi
           # `--help` exits 0 without booting the server, so no config/network is
           # needed to prove crw-server is a working binary for this arch.
           docker run --rm --platform "$PLATFORM" \
