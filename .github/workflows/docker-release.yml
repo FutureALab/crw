@@ -15,12 +15,17 @@ on:
     types: [published]
   # Manual recovery for a tag whose release already exists. Idempotent —
   # uploads use --clobber, so re-running replaces the archives instead of
-  # failing on a name collision.
+  # failing on a name collision. Passing `source_ref` instead makes it a
+  # build-only dry run (see that input).
   workflow_dispatch:
     inputs:
       tag:
         description: "Existing release tag to build and attach the image archives to (e.g. v0.35.1)."
         required: true
+      source_ref:
+        description: "Optional. Build from this ref (branch/SHA) instead of the tag — a build-only dry run that skips the release upload. Use it to validate the pipeline before the tag exists."
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -36,17 +41,25 @@ jobs:
       tag: ${{ steps.ctx.outputs.tag }}
       version: ${{ steps.ctx.outputs.version }}
       image: ${{ steps.ctx.outputs.image }}
+      checkout_ref: ${{ steps.ctx.outputs.checkout_ref }}
+      # 'true' unless this is a build-only dry run; gates the release upload.
+      attach: ${{ steps.ctx.outputs.attach }}
     steps:
       - id: ctx
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             tag="${{ inputs.tag }}"
             [ -n "$tag" ] || { echo "::error::workflow_dispatch requires the tag input"; exit 1; }
+            source_ref="${{ inputs.source_ref }}"
           else
             tag="${{ github.event.release.tag_name }}"
             [ -n "$tag" ] || { echo "::error::could not read the release tag from the event"; exit 1; }
+            source_ref=""
           fi
           # Same semver gate as release.yml: a non-version tag has no meaningful
           # `{{version}}` to tag the image with, so refuse rather than ship an
@@ -57,12 +70,39 @@ jobs:
           # Registry references must be lowercase; a mixed-case owner/repo would
           # otherwise be rejected by the daemon at build time.
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
+
+          # A build-only dry run (source_ref given and different from the tag)
+          # never touches the release: archives stay as run artifacts. Attaching
+          # an image built from main to a release tag would be silent
+          # mislabelling, which is exactly what the release pipeline must not do.
+          if [ -n "$source_ref" ] && [ "$source_ref" != "$tag" ]; then
+            attach=false
+            checkout_ref="$source_ref"
+            echo "::notice::dry run — building from '$source_ref'; archives will NOT be attached to release '$tag'"
+          else
+            attach=true
+            # A fully-qualified ref: `actions/checkout` with a bare `v0.35.1`
+            # also globs refs/heads/v0.35.1*, and the failure mode when the tag
+            # is missing is an opaque `git ... exit code 1` after three retries.
+            checkout_ref="refs/tags/${tag}"
+            # Fail here, in seconds, instead of after the heavy matrix: a tag
+            # that does not exist upstream (e.g. this repo has no tags yet, or
+            # release-please never cut it) means checkout cannot resolve the ref
+            # and there is no release to attach to either.
+            if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+              echo "::error::tag '$tag' does not exist in ${GITHUB_REPOSITORY} — push the tag (or let release-please cut the release) first, or re-run with source_ref set to a branch/SHA for a build-only dry run"
+              exit 1
+            fi
+          fi
+
           {
             echo "tag=$tag"
             echo "version=$version"
             echo "image=$image"
+            echo "checkout_ref=$checkout_ref"
+            echo "attach=$attach"
           } >> "$GITHUB_OUTPUT"
-          echo "::notice::docker image release context: tag=$tag version=$version image=$image"
+          echo "::notice::docker image release context: tag=$tag version=$version image=$image ref=$checkout_ref attach=$attach"
 
   build-and-save:
     needs: release-context
@@ -93,7 +133,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.release-context.outputs.tag }}
+          ref: ${{ needs.release-context.outputs.checkout_ref }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
@@ -188,6 +228,8 @@ jobs:
 
   attach-to-release:
     needs: [release-context, build-and-save]
+    # Skipped (gray, not failed) on a build-only dry run — see release-context.
+    if: ${{ needs.release-context.outputs.attach == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
