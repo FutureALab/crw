@@ -26,6 +26,10 @@ on:
         description: "Optional. Build from this ref (branch, tag, or commit SHA) instead of the release tag — a build-only dry run that skips the release upload. Use it to validate the pipeline before the tag exists."
         required: false
         default: ""
+      image_target:
+        description: "Optional. Dockerfile target to build. Default runtime-js = self-contained image with the Chromium JS renderer baked in and started by the entrypoint. runtime = the lean image, which ships no renderer and expects a CDP sidecar."
+        required: false
+        default: "runtime-js"
 
 permissions:
   contents: read
@@ -44,6 +48,7 @@ jobs:
       checkout_ref: ${{ steps.ctx.outputs.checkout_ref }}
       # 'true' unless this is a build-only dry run; gates the release upload.
       attach: ${{ steps.ctx.outputs.attach }}
+      image_target: ${{ steps.ctx.outputs.image_target }}
     steps:
       - id: ctx
         shell: bash
@@ -56,10 +61,15 @@ jobs:
             tag="${{ inputs.tag }}"
             [ -n "$tag" ] || { echo "::error::workflow_dispatch requires the tag input"; exit 1; }
             source_ref="${{ inputs.source_ref }}"
+            image_target="${{ inputs.image_target }}"
+            [ -n "$image_target" ] || image_target=runtime-js
           else
             tag="${{ github.event.release.tag_name }}"
             [ -n "$tag" ] || { echo "::error::could not read the release tag from the event"; exit 1; }
             source_ref=""
+            # A published release always ships the self-contained image; the
+            # lean target is a dispatch-only choice.
+            image_target=runtime-js
           fi
           # Same semver gate as release.yml: a non-version tag has no meaningful
           # `{{version}}` to tag the image with, so refuse rather than ship an
@@ -70,6 +80,15 @@ jobs:
           # Registry references must be lowercase; a mixed-case owner/repo would
           # otherwise be rejected by the daemon at build time.
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
+
+          # Allowlist instead of passing the input straight into `--target`:
+          # a typo would otherwise fail the build ~30 minutes in, after the
+          # Rust compile, with an opaque "target stage not found" error.
+          case "$image_target" in
+            runtime|runtime-js) ;;
+            *) echo "::error::image_target '$image_target' is not a target in the Dockerfile (runtime | runtime-js)"
+               exit 1 ;;
+          esac
 
           # A build-only dry run (source_ref given and different from the tag)
           # never touches the release: archives stay as run artifacts. Attaching
@@ -111,8 +130,9 @@ jobs:
             echo "image=$image"
             echo "checkout_ref=$checkout_ref"
             echo "attach=$attach"
+            echo "image_target=$image_target"
           } >> "$GITHUB_OUTPUT"
-          echo "::notice::docker image release context: tag=$tag version=$version image=$image ref=$checkout_ref attach=$attach"
+          echo "::notice::docker image release context: tag=$tag version=$version image=$image ref=$checkout_ref attach=$attach target=$image_target"
 
   build-and-save:
     needs: release-context
@@ -174,6 +194,14 @@ jobs:
           context: .
           push: false
           load: true
+          # runtime-js bakes Chromium in and starts it from the image
+          # entrypoint (LightPanda cannot be baked onto this base — upstream
+          # needs glibc 2.38, see the Dockerfile). The Dockerfile's default
+          # target (`runtime`) ships no JS renderer at all — correct for
+          # docker-compose, which supplies sidecars, but useless for an archive
+          # somebody downloads and `docker run`s on its own, which is what this
+          # workflow hands out.
+          target: ${{ needs.release-context.outputs.image_target }}
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           tags: |

@@ -140,8 +140,8 @@ RUN set -eux; \
     done; \
     test -f /out/crw-server   # crw-server is required in every build
 
-# ---- runtime (unchanged) ----------------------------------------------------
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+# ---- runtime base (shared by every runtime target) --------------------------
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime-base
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
@@ -157,5 +157,53 @@ WORKDIR /app
 LABEL io.modelcontextprotocol.server.name="io.github.us/crw"
 
 EXPOSE 3000
+
+# ---- self-contained JS-rendering runtime ------------------------------------
+# `--target runtime-js` bakes Chromium in so a plain `docker run` renders JS
+# with no sidecar: the entrypoint starts it and points the engine at it
+# (`CRW_RENDERER__CHROME__WS_URL`), unless the operator already set that
+# variable — a Compose sidecar or remote browser always wins.
+#
+# WHY CHROMIUM AND NOT LIGHTPANDA: LightPanda is the cheaper first tier, but
+# upstream's Linux binaries (0.4.0 and 0.3.7, both arches) require GLIBC_2.38
+# and this base image has 2.36 — the binary is present but cannot exec, which is
+# worse than not shipping it. Verified with the loader:
+#   lightpanda: /lib/aarch64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found
+# Baking it becomes possible when this base moves past glibc 2.36 (Debian
+# trixie), or by pinning the stale 0.3.0 build, which needs 2.34 — neither is a
+# call this Dockerfile should make on its own. Until then the fast tier comes
+# from the Compose sidecar (docker-compose.yml) or a remote endpoint.
+#
+# The default target stays lean and sidecar-rendered: that is what `docker
+# build .`, `docker compose build` and the prod engine build produce, and it is
+# the last stage in this file for exactly that reason.
+FROM runtime-base AS runtime-with-entrypoint
+
+COPY docker/crw-entrypoint.sh /usr/local/bin/crw-entrypoint
+RUN chmod 0755 /usr/local/bin/crw-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/crw-entrypoint"]
+CMD ["crw-server"]
+
+# Debian's chromium (bookworm ships it for amd64 and arm64) rather than copying
+# chromedp/headless-shell: it arrives with every runtime dependency, is covered
+# by the base image already being digest-pinned, and the flags the entrypoint
+# passes match the chrome sidecar in docker-compose.yml.
+FROM runtime-with-entrypoint AS runtime-js
+
+RUN apt-get update; \
+    apt-get install -y --no-install-recommends chromium; \
+    rm -rf /var/lib/apt/lists/*
+
+# Only the backends named here are started by the entrypoint; a LightPanda
+# binary dropped into a derived image (newer base, or a custom COPY) starts on
+# its own once 'lightpanda' is added to this list.
+ENV CRW_JS_BACKENDS=chrome
+
+# ---- lean runtime (DEFAULT TARGET — must stay last in this file) ------------
+# Unchanged from before the bundled targets existed: no browser, no entrypoint,
+# sidecar-rendered, ~150MB. `docker build .`, `docker compose build` and the
+# prod engine build all land here unless they pass an explicit --target.
+FROM runtime-base AS runtime
 
 CMD ["crw-server"]

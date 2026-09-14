@@ -480,6 +480,16 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
+          # runtime-js, not the Dockerfile's default `runtime` target: the
+          # published image has to work for somebody who pulls it and runs
+          # `docker run ghcr.io/<repo>` with no sidecars, which means a JS
+          # renderer baked in (Chromium; LightPanda needs glibc 2.38, this base
+          # has 2.36 — see the Dockerfile). docker-compose.yml still builds the
+          # lean target and attaches the browsers as sidecars; the prod engine
+          # image (rolling-deploy.sh) is built separately and is unaffected.
+          # docker-release.yml builds this same target for the release archives,
+          # so the two published artifacts stay identical.
+          target: runtime-js
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
