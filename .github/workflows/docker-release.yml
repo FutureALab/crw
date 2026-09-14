@@ -162,8 +162,29 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
         with:
           ref: ${{ needs.release-context.outputs.checkout_ref }}
+
+      # A tag can point at a commit older than the Dockerfile change that added
+      # `runtime-js`. `docker buildx --target` then fails with a bare
+      # "target stage could not be found" that reads like a typo, while the real
+      # problem is that the tagged tree predates the bundled-renderer image.
+      # Say so here, in seconds, before the ~30 minute Rust compile.
+      - name: Verify the requested target exists in this ref
+        shell: bash
+        env:
+          TARGET: ${{ needs.release-context.outputs.image_target }}
+          REF: ${{ needs.release-context.outputs.checkout_ref }}
+        run: |
+          set -euo pipefail
+          if ! grep -qE "^FROM .* AS ${TARGET}$" Dockerfile; then
+            echo "::error::Dockerfile at ${REF} has no '${TARGET}' stage — that ref predates the bundled-renderer image. Re-point the tag at a commit that has it, or dispatch with image_target=runtime."
+            echo "::group::stages available at ${REF}"
+            grep -nE '^FROM ' Dockerfile || true
+            echo "::endgroup::"
+            exit 1
+          fi
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
@@ -178,6 +199,11 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ needs.release-context.outputs.image }}
+          # Label the artifact with the commit actually checked out. Default is
+          # github.sha, which for a release event is the tagged commit — but this
+          # job may build a different ref (dry run, or a re-pointed tag), and a
+          # revision label that lies about its provenance is worse than none.
+          revision: ${{ steps.checkout.outputs.commit }}
           tags: |
             type=semver,pattern={{version}},value=${{ needs.release-context.outputs.tag }}
 
